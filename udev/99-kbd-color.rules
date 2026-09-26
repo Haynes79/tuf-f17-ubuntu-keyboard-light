@@ -1,2 +1,4 @@
 # Let the plugdev group control the ASUS keyboard light
 SUBSYSTEM=="leds", KERNEL=="asus::kbd_backlight", RUN+="/bin/sh -c 'chgrp plugdev /sys%p/brightness /sys%p/kbd_rgb_mode /sys%p/kbd_rgb_state; chmod g+w /sys%p/brightness /sys%p/kbd_rgb_mode /sys%p/kbd_rgb_state'"
+# Let the plugdev group read ASUS Fn hotkeys (only this hotkey device, not the main keyboard)
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Asus WMI hotkeys", GROUP="plugdev", MODE="0640"

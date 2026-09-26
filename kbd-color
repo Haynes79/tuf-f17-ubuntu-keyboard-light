@@ -7,18 +7,24 @@
   kbd-color battery             colour follows battery level (red low -> green full)
   kbd-color heat                colour follows CPU temperature (blue cool -> red hot)
   kbd-color breathe blue slow   effect + colour + speed (slow|medium|fast)
+  kbd-color next | prev         switch to the next / previous effect (Fn+Left does "next")
   kbd-color brightness 0-3
   kbd-color off | on
   kbd-color power awake on      keyboard light on boot / awake / sleep: on|off
   kbd-color apply               re-apply the saved setting (used at login)
-  kbd-color daemon              keeps battery/heat colours live (run by the systemd user service)
+  kbd-color daemon              keeps battery/heat colours live, handles the Fn+Left hotkey
+                                (run by the systemd user service)
+  kbd-color keys                print the codes ASUS hotkeys send (for finding new hotkeys)
   kbd-color gui                 small window
 """
 import colorsys
 import glob
 import json
 import os
+import struct
+import subprocess
 import sys
+import threading
 import time
 
 LED = os.environ.get("KBD_COLOR_LED", "/sys/class/leds/asus::kbd_backlight")
@@ -41,6 +47,10 @@ COLORS = {
     "magenta": (255, 0, 255), "purple": (128, 0, 255), "orange": (255, 100, 0),
     "pink": (255, 60, 150),
 }
+# ASUS WMI hotkey codes (from `kbd-color keys`) -> effect step. Fn+Left sends 0xb2;
+# Fn+Right sends nothing to Linux on the FX706HF, so Fn+Left cycles forward and wraps.
+HOTKEYS = {0xb2: 1}
+HOTKEY_DEVICE = "Asus WMI hotkeys"
 DEFAULT = {"mode": "static", "rgb": [255, 255, 255], "speed": "medium", "brightness": 3,
            "boot": True, "awake": True, "sleep": True}
 
@@ -60,8 +70,10 @@ def load():
 
 def save(cfg):
     os.makedirs(os.path.dirname(CONF), exist_ok=True)
-    with open(CONF, "w") as f:
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(cfg, f)
+    os.replace(tmp, CONF)  # atomic, so the daemon / app never read a half-written file
 
 
 class KbdError(Exception):
@@ -161,8 +173,76 @@ def set_mode(mode, rgb, speed):
     write("kbd_rgb_mode", f"0 {MODES[mode]} {r} {g} {b} {SPEEDS[speed]}")
 
 
+def step_effect(cfg, step):
+    cfg["mode"] = EFFECTS[(EFFECTS.index(cfg["mode"]) + step) % len(EFFECTS)]
+    cfg["brightness"] = max(cfg["brightness"], 1)
+    apply(cfg)
+    save(cfg)
+
+
+def notify(text):
+    """Short desktop popup that replaces the previous one instead of stacking."""
+    try:
+        subprocess.run(["notify-send", "-a", "Keyboard Light", "-i", "input-keyboard", "-t", "1500",
+                        "-h", "string:x-canonical-private-synchronous:kbd-color", "Keyboard light", text],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def hotkey_device():
+    for d in glob.glob("/sys/class/input/event*"):
+        try:
+            with open(d + "/device/name") as f:
+                if f.read().strip() == HOTKEY_DEVICE:
+                    return "/dev/input/" + os.path.basename(d)
+        except OSError:
+            pass
+    return None
+
+
+EVENT = struct.Struct("llHHi")  # struct input_event: timeval, type, code, value
+EV_MSC, MSC_SCAN = 4, 4
+
+
+def hotkey_presses():
+    """Yield the ASUS hotkey code of each key press. One press arrives as a burst of repeats,
+    so a code only counts again after a short quiet gap."""
+    dev = hotkey_device()
+    if dev is None:
+        raise KbdError(f"input device '{HOTKEY_DEVICE}' not found")
+    try:
+        f = open(dev, "rb", buffering=0)
+    except PermissionError:
+        raise KbdError(f"No permission to read {dev}. Run ./install.sh from the kbd-color project first.")
+    last = 0.0
+    with f:
+        while True:
+            _, _, typ, code, value = EVENT.unpack(f.read(EVENT.size))
+            if typ != EV_MSC or code != MSC_SCAN:
+                continue
+            now = time.monotonic()
+            quiet, last = now - last > 0.4, now
+            if quiet:
+                yield value
+
+
+def hotkeys():
+    """Background thread for the daemon: Fn+Left switches effect. The main loop picks up the
+    saved change through the config file's mtime."""
+    try:
+        for code in hotkey_presses():
+            if code in HOTKEYS:
+                cfg = load()
+                step_effect(cfg, HOTKEYS[code])
+                notify(LABELS[cfg["mode"]])
+    except KbdError as e:
+        print(f"kbd-color: hotkeys disabled: {e}", file=sys.stderr)
+
+
 def daemon():
     """Apply the saved setting, then keep battery / heat colours up to date."""
+    threading.Thread(target=hotkeys, daemon=True).start()
     cfg = load()
     try:
         apply(cfg, power=True)
@@ -214,7 +294,7 @@ def gui(cfg):
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Adw, Gdk, Gtk
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
     class Window(Adw.ApplicationWindow):
         def __init__(self, app):
@@ -290,6 +370,31 @@ def gui(cfg):
             self.loading = False
             self.refresh()
 
+            # Follow changes made elsewhere (Fn+Left hotkey, the command line).
+            self.reload_id = 0
+            self.monitor = Gio.File.new_for_path(CONF).monitor_file(Gio.FileMonitorFlags.NONE, None)
+            self.monitor.connect("changed", self.on_file_changed)
+
+        def on_file_changed(self, *_):
+            if not self.reload_id:
+                self.reload_id = GLib.timeout_add(150, self.reload)
+
+        def reload(self):
+            self.reload_id = 0
+            new = load()
+            if new != cfg:
+                cfg.update(new)
+                self.loading = True  # don't write the values back
+                self.mode.set_selected(EFFECTS.index(cfg["mode"]))
+                self.speed.set_selected(list(SPEEDS).index(cfg["speed"]))
+                self.picker.set_rgba(self.rgba(cfg["rgb"]))
+                self.bright.set_value(cfg["brightness"])
+                for key, sw in self.power.items():
+                    sw.set_active(bool(cfg[key]))
+                self.loading = False
+                self.refresh()
+            return GLib.SOURCE_REMOVE
+
         @staticmethod
         def rgba(rgb):
             c = Gdk.RGBA()
@@ -356,6 +461,16 @@ def main(argv):
         return gui(cfg)
     if cmd == "daemon":
         return daemon()
+    if cmd == "keys":
+        print("press ASUS Fn hotkeys (Ctrl+C to stop)")
+        try:
+            for code in hotkey_presses():
+                print(f"0x{code:x}" + ("  (mapped)" if code in HOTKEYS else ""), flush=True)
+        except KeyboardInterrupt:
+            return
+    if cmd in ("next", "prev"):
+        step_effect(cfg, 1 if cmd == "next" else -1)
+        return print(LABELS[cfg["mode"]])
     if cmd == "apply":
         return apply(cfg, power=True)
     if cmd == "power":

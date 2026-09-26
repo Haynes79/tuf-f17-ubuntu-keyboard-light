@@ -21,7 +21,7 @@ EOT
 
 # Root step: use sudo in a terminal, otherwise a graphical password prompt (pkexec).
 if [ -t 0 ]; then ROOT=sudo; else ROOT=pkexec; fi
-$ROOT sh -c "cp '$DIR/udev/99-kbd-color.rules' /etc/udev/rules.d/99-kbd-color.rules && udevadm control --reload && udevadm trigger --subsystem-match=leds --action=add"
+$ROOT sh -c "cp '$DIR/udev/99-kbd-color.rules' /etc/udev/rules.d/99-kbd-color.rules && udevadm control --reload && udevadm trigger --subsystem-match=leds --action=add && udevadm trigger --subsystem-match=input --property-match=ID_PATH=platform-asus-nb-wmi --action=change"
 # Background service: applies your saved setting at login and keeps battery/heat colours live.
 cat > "$HOME/.config/systemd/user/kbd-color.service" <<EOT
 [Unit]
