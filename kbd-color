@@ -18,13 +18,15 @@
   kbd-color gui                 small window
 """
 import colorsys
+import functools
 import glob
 import json
 import os
+import select
+import signal
 import struct
 import subprocess
 import sys
-import threading
 import time
 
 LED = os.environ.get("KBD_COLOR_LED", "/sys/class/leds/asus::kbd_backlight")
@@ -55,7 +57,9 @@ DEFAULT = {"mode": "static", "rgb": [255, 255, 255], "speed": "medium", "brightn
            "boot": True, "awake": True, "sleep": True}
 
 
-def load():
+def load(live=True):
+    """Saved setting. With live=True the brightness is the keyboard's current one, since
+    Fn+Up/Down change it without going through kbd-color."""
     try:
         with open(CONF) as f:
             cfg = {**DEFAULT, **json.load(f)}
@@ -63,9 +67,13 @@ def load():
             cfg["mode"] = "cycle"
         if cfg["mode"] not in EFFECTS:  # e.g. another effect that was removed
             cfg["mode"] = "static"
-        return cfg
     except (OSError, ValueError):
-        return dict(DEFAULT)
+        cfg = dict(DEFAULT)
+    if live:
+        b = read_int(os.path.join(LED, "brightness"))
+        if b is not None:
+            cfg["brightness"] = b
+    return cfg
 
 
 def save(cfg):
@@ -91,45 +99,48 @@ def write(name, value):
         raise KbdError(f"{path}: {e}")
 
 
-def read_int(path):
+def read_text(path):
     try:
         with open(path) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
+            return f.read().strip()
+    except OSError:
         return None
 
 
-def battery_percent():
-    for d in sorted(glob.glob("/sys/class/power_supply/BAT*")):
-        v = read_int(d + "/capacity")
-        if v is not None:
-            return v
+def read_int(path):
+    try:
+        return int(read_text(path))
+    except (TypeError, ValueError):
+        return None
+
+
+# Sensor files are looked up once; after that each reading is a single small read.
+@functools.cache
+def battery_path():
+    return next((p for p in sorted(glob.glob("/sys/class/power_supply/BAT*/capacity"))), None)
+
+
+@functools.cache
+def cpu_temp_path():
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read_text(d + "/name") == "coretemp":
+            return d + "/temp1_input"
+    for d in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if read_text(d + "/type") == "x86_pkg_temp":
+            return d + "/temp"
     return None
+
+
+def battery_percent():
+    p = battery_path()
+    return p and read_int(p)
 
 
 def cpu_temp():
     """CPU package temperature in degrees C, or None."""
-    for d in glob.glob("/sys/class/hwmon/hwmon*"):
-        try:
-            with open(d + "/name") as f:
-                if f.read().strip() != "coretemp":
-                    continue
-        except OSError:
-            continue
-        v = read_int(d + "/temp1_input")
-        if v is not None:
-            return v / 1000
-    for d in glob.glob("/sys/class/thermal/thermal_zone*"):
-        try:
-            with open(d + "/type") as f:
-                if f.read().strip() != "x86_pkg_temp":
-                    continue
-        except OSError:
-            continue
-        v = read_int(d + "/temp")
-        if v is not None:
-            return v / 1000
-    return None
+    p = cpu_temp_path()
+    v = p and read_int(p)
+    return None if v is None else v / 1000
 
 
 def hue_rgb(hue):
@@ -161,13 +172,14 @@ def apply(cfg, power=False):
         apply_power(cfg)
     write("brightness", str(cfg["brightness"]))
     if cfg["brightness"] > 0:
-        set_mode(cfg["mode"], cfg["rgb"], cfg["speed"])
+        if cfg["mode"] in DYNAMIC:  # shown as a static colour picked from the sensor
+            set_mode("static", dynamic_rgb(cfg["mode"]), "medium")
+        else:
+            set_mode(cfg["mode"], cfg["rgb"], cfg["speed"])
 
 
 def set_mode(mode, rgb, speed):
-    """Send one colour/effect to the keyboard. Dynamic modes are shown as a static colour."""
-    if mode in DYNAMIC:
-        mode, rgb, speed = "static", dynamic_rgb(mode), "medium"
+    """Send one colour/effect to the keyboard."""
     r, g, b = rgb
     # First field 0 = temporary set (G-Helper's 0xb4); 1 would save to the laptop's memory on every change.
     write("kbd_rgb_mode", f"0 {MODES[mode]} {r} {g} {b} {SPEEDS[speed]}")
@@ -180,98 +192,149 @@ def step_effect(cfg, step):
     save(cfg)
 
 
+def log(msg):
+    print(f"kbd-color: {msg}", file=sys.stderr, flush=True)
+
+
 def notify(text):
-    """Short desktop popup that replaces the previous one instead of stacking."""
+    """Short desktop popup that replaces the previous one instead of stacking. Not waited for;
+    the daemon ignores SIGCHLD so the kernel reaps it."""
     try:
-        subprocess.run(["notify-send", "-a", "Keyboard Light", "-i", "input-keyboard", "-t", "1500",
-                        "-h", "string:x-canonical-private-synchronous:kbd-color", "Keyboard light", text],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+        subprocess.Popen(["notify-send", "-a", "Keyboard Light", "-i", "input-keyboard", "-t", "1500",
+                          "-h", "string:x-canonical-private-synchronous:kbd-color", "Keyboard light", text],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
         pass
-
-
-def hotkey_device():
-    for d in glob.glob("/sys/class/input/event*"):
-        try:
-            with open(d + "/device/name") as f:
-                if f.read().strip() == HOTKEY_DEVICE:
-                    return "/dev/input/" + os.path.basename(d)
-        except OSError:
-            pass
-    return None
 
 
 EVENT = struct.Struct("llHHi")  # struct input_event: timeval, type, code, value
 EV_MSC, MSC_SCAN = 4, 4
 
 
-def hotkey_presses():
-    """Yield the ASUS hotkey code of each key press. One press arrives as a burst of repeats,
-    so a code only counts again after a short quiet gap."""
-    dev = hotkey_device()
-    if dev is None:
-        raise KbdError(f"input device '{HOTKEY_DEVICE}' not found")
-    try:
-        f = open(dev, "rb", buffering=0)
-    except PermissionError:
-        raise KbdError(f"No permission to read {dev}. Run ./install.sh from the kbd-color project first.")
-    last = 0.0
-    with f:
+class Hotkeys:
+    """ASUS Fn hotkeys from the "Asus WMI hotkeys" input device (not the main keyboard).
+    One press arrives as a burst of repeats, so a code only counts again after a short gap."""
+
+    def __init__(self):
+        dev = next(("/dev/input/" + os.path.basename(d) for d in glob.glob("/sys/class/input/event*")
+                    if read_text(d + "/device/name") == HOTKEY_DEVICE), None)
+        if dev is None:
+            raise KbdError(f"input device '{HOTKEY_DEVICE}' not found")
+        try:
+            self.fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except PermissionError:
+            raise KbdError(f"No permission to read {dev}. Run ./install.sh from the kbd-color project first.")
+        self.last = 0.0
+
+    def fileno(self):
+        return self.fd
+
+    def presses(self):
+        """Codes of the presses waiting to be read (call when select() says it's readable)."""
+        codes = []
+        try:
+            data = os.read(self.fd, EVENT.size * 64)
+        except BlockingIOError:
+            return codes
+        for sec, usec, typ, code, value in EVENT.iter_unpack(data):
+            if typ == EV_MSC and code == MSC_SCAN:
+                t = sec + usec / 1e6
+                if t - self.last > 0.4:
+                    codes.append(value)
+                self.last = t
+        return codes
+
+
+IN_CLOSE_WRITE, IN_MOVED_TO = 0x8, 0x80
+INOTIFY_EVENT = struct.Struct("iIII")  # struct inotify_event without the name: wd, mask, cookie, len
+
+
+class ConfigWatch:
+    """Readable when the config file has been saved (inotify on its folder)."""
+
+    def __init__(self):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        folder = os.path.dirname(CONF)
+        os.makedirs(folder, exist_ok=True)
+        self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0 or libc.inotify_add_watch(self.fd, os.fsencode(folder), IN_CLOSE_WRITE | IN_MOVED_TO) < 0:
+            raise OSError(ctypes.get_errno(), "inotify")
+        self.name = os.fsencode(os.path.basename(CONF))
+
+    def fileno(self):
+        return self.fd
+
+    def changed(self):
+        """Drain pending events; True if one of them was the config file."""
+        hit = False
         while True:
-            _, _, typ, code, value = EVENT.unpack(f.read(EVENT.size))
-            if typ != EV_MSC or code != MSC_SCAN:
-                continue
-            now = time.monotonic()
-            quiet, last = now - last > 0.4, now
-            if quiet:
-                yield value
+            try:
+                data = os.read(self.fd, 4096)
+            except BlockingIOError:
+                return hit
+            i = 0
+            while i < len(data):
+                n = INOTIFY_EVENT.unpack_from(data, i)[3]
+                i += INOTIFY_EVENT.size
+                hit |= data[i:i + n].rstrip(b"\0") == self.name
+                i += n
 
 
-def hotkeys():
-    """Background thread for the daemon: Fn+Left switches effect. The main loop picks up the
-    saved change through the config file's mtime."""
-    try:
-        for code in hotkey_presses():
-            if code in HOTKEYS:
-                cfg = load()
-                step_effect(cfg, HOTKEYS[code])
-                notify(LABELS[cfg["mode"]])
-    except KbdError as e:
-        print(f"kbd-color: hotkeys disabled: {e}", file=sys.stderr)
+INTERVAL = {"battery": 30, "heat": 2}  # seconds between sensor readings
+REFRESH = 60  # re-send a dynamic colour this often even if unchanged, e.g. after suspend
 
 
 def daemon():
-    """Apply the saved setting, then keep battery / heat colours up to date."""
-    threading.Thread(target=hotkeys, daemon=True).start()
-    cfg = load()
+    """Apply the saved setting at login, then sleep until something happens: the config file
+    is saved, an Fn hotkey is pressed, or (battery / heat modes only) a sensor reading is due.
+    With any other effect the process doesn't wake up at all while idle."""
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # notify-send popups are reaped by the kernel
+    cfg = load(live=False)
     try:
         apply(cfg, power=True)
     except KbdError as e:
-        print(f"kbd-color: {e}", file=sys.stderr)
-    mtime, sent, avg, tick = None, None, None, 0
+        log(e)
+    watch = ConfigWatch()
+    try:
+        keys = Hotkeys()
+    except KbdError as e:
+        keys = None
+        log(f"hotkeys disabled: {e}")
+    sent, sent_at, avg, due = None, 0.0, None, 0.0
     while True:
+        timeout = max(0.0, due - time.monotonic()) if cfg["mode"] in DYNAMIC else None
+        ready = select.select([watch, keys] if keys else [watch], [], [], timeout)[0]
         try:
-            m = os.stat(CONF).st_mtime
-        except OSError:
-            m = None
-        if m != mtime:
-            mtime, cfg, sent = m, load(), None
-        if cfg["mode"] in DYNAMIC and read_int(os.path.join(LED, "brightness")):
-            temp = None
-            if cfg["mode"] == "heat":
-                t = cpu_temp()
-                if t is not None:
-                    avg = t if avg is None else 0.7 * avg + 0.3 * t  # ride out short spikes
-                temp = avg
-            rgb = dynamic_rgb(cfg["mode"], temp)
-            tick += 1
-            if rgb != sent or tick % 30 == 0:  # also refresh now and then, e.g. after suspend
+            if watch in ready and watch.changed():
+                cfg, sent, avg, due = load(), None, None, 0.0
+            if keys and keys in ready:
                 try:
-                    set_mode(cfg["mode"], rgb, "medium")
-                    sent = rgb
-                except KbdError as e:
-                    print(f"kbd-color: {e}", file=sys.stderr)
-        time.sleep(2)
+                    codes = keys.presses()
+                except OSError as e:  # device went away
+                    codes, keys = [], None
+                    log(f"hotkeys disabled: {e}")
+                for code in codes:
+                    if code in HOTKEYS:
+                        cfg = load()
+                        step_effect(cfg, HOTKEYS[code])  # the save wakes us again via ConfigWatch
+                        notify(LABELS[cfg["mode"]])
+            now = time.monotonic()
+            if cfg["mode"] in DYNAMIC and now >= due:
+                due = now + INTERVAL[cfg["mode"]]
+                if read_int(os.path.join(LED, "brightness")):
+                    temp = None
+                    if cfg["mode"] == "heat":
+                        t = cpu_temp()
+                        if t is not None:
+                            avg = t if avg is None else 0.7 * avg + 0.3 * t  # ride out short spikes
+                        temp = avg
+                    rgb = dynamic_rgb(cfg["mode"], temp)
+                    if rgb != sent or now - sent_at >= REFRESH:
+                        set_mode("static", rgb, "medium")
+                        sent, sent_at = rgb, now
+        except KbdError as e:
+            log(e)
 
 
 def parse_color(s):
@@ -327,13 +390,12 @@ def gui(cfg):
             self.color_grp.add(row)
             flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=9,
                                column_spacing=6, row_spacing=6, margin_top=8, margin_bottom=8)
+            css = Gtk.CssProvider()
+            css.load_from_string("".join(f"button.swatch-{n} {{ background: rgb{COLORS[n]}; min-width: 34px;"
+                                         f" min-height: 34px; }}" for n in SWATCHES))
+            Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             for name in SWATCHES:
-                btn = Gtk.Button(width_request=34, height_request=34, tooltip_text=name)
-                btn.add_css_class("circular")
-                css = Gtk.CssProvider()
-                r, g, b = COLORS[name]
-                css.load_from_string(f"button {{ background: rgb({r},{g},{b}); min-width: 34px; min-height: 34px; }}")
-                btn.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                btn = Gtk.Button(tooltip_text=name, css_classes=["circular", f"swatch-{name}"])
                 btn.connect("clicked", self.on_swatch, name)
                 flow.append(btn)
             self.color_grp.add(flow)
@@ -454,18 +516,21 @@ def main(argv):
     if not os.path.isdir(LED):
         sys.exit(f"kbd-color: {LED} not found (needs an ASUS laptop with asus-wmi)")
 
-    cfg = load()
     cmd = argv[0].lower()
+    cfg = load(live=cmd != "apply")  # apply restores the saved brightness too
 
     if cmd == "gui":
         return gui(cfg)
     if cmd == "daemon":
         return daemon()
     if cmd == "keys":
+        keys = Hotkeys()
         print("press ASUS Fn hotkeys (Ctrl+C to stop)")
         try:
-            for code in hotkey_presses():
-                print(f"0x{code:x}" + ("  (mapped)" if code in HOTKEYS else ""), flush=True)
+            while True:
+                select.select([keys], [], [])
+                for code in keys.presses():
+                    print(f"0x{code:x}" + ("  (mapped)" if code in HOTKEYS else ""), flush=True)
         except KeyboardInterrupt:
             return
     if cmd in ("next", "prev"):
@@ -484,7 +549,7 @@ def main(argv):
     elif cmd == "on":
         cfg["brightness"] = max(cfg["brightness"], 1)
     elif cmd == "brightness":
-        if len(argv) < 2 or argv[1] not in "0123" or len(argv[1]) != 1:
+        if len(argv) != 2 or argv[1] not in ("0", "1", "2", "3"):
             sys.exit("kbd-color: brightness takes 0-3")
         cfg["brightness"] = int(argv[1])
     else:

@@ -1,7 +1,7 @@
 # kbd-color
 
 Tiny keyboard light controller for ASUS laptops (tested target: TUF Gaming F17 FX706HF).
-Uses the kernel's `asus-wmi` sysfs interface at `/sys/class/leds/asus::kbd_backlight/`. No daemon, no dependencies beyond Python 3 (and GTK 4 + libadwaita, already on Ubuntu GNOME, for the settings app).
+Uses the kernel's `asus-wmi` sysfs interface at `/sys/class/leds/asus::kbd_backlight/`. No dependencies beyond Python 3 (and GTK 4 + libadwaita, already on Ubuntu GNOME, for the settings app).
 
 ## Install
 
@@ -42,8 +42,10 @@ Changes are sent as temporary sets, so the laptop's memory isn't rewritten on ev
 ### Battery and heat colours
 
 These are software-driven: `kbd-color daemon` (run by the `kbd-color.service` systemd user service) reads the
-battery level or CPU package temperature every 2 seconds and sets a matching static colour.
+battery level every 30 seconds or the CPU package temperature every 2 seconds and sets a matching static colour.
 It only rewrites the light when the colour moves by a noticeable step, and never touches brightness.
+With any other effect the service sleeps until the settings file changes or an Fn hotkey is pressed, so it
+uses no CPU while idle.
 Battery: red at 10% and below, green at 80% and above. Heat: blue at 40C and below, red at 90C and above.
 Logs: `journalctl --user -u kbd-color`.
 
