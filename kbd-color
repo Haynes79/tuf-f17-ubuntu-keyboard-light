@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""kbd-color: tiny keyboard light controller for ASUS laptops (asus-wmi sysfs).
+
+  kbd-color red                 solid colour by name
+  kbd-color ff8800              solid colour by hex
+  kbd-color rainbow [speed]     effects: static breathe cycle rainbow
+  kbd-color breathe blue slow   effect + colour + speed
+  kbd-color brightness 0-3
+  kbd-color off | on
+  kbd-color apply               re-apply the saved setting (used at login)
+  kbd-color gui                 small window
+"""
+import json
+import os
+import sys
+
+LED = "/sys/class/leds/asus::kbd_backlight"
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "kbd-color.json")
+
+MODES = {"static": 0, "breathe": 1, "cycle": 2, "rainbow": 3}
+SPEEDS = {"slow": 0, "medium": 1, "fast": 2}
+COLORS = {
+    "red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
+    "white": (255, 255, 255), "yellow": (255, 255, 0), "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255), "purple": (128, 0, 255), "orange": (255, 100, 0),
+    "pink": (255, 60, 150),
+}
+DEFAULT = {"mode": "static", "rgb": [255, 255, 255], "speed": "medium", "brightness": 3}
+
+
+def load():
+    try:
+        with open(CONF) as f:
+            return {**DEFAULT, **json.load(f)}
+    except (OSError, ValueError):
+        return dict(DEFAULT)
+
+
+def save(cfg):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        json.dump(cfg, f)
+
+
+def write(name, value):
+    path = os.path.join(LED, name)
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except PermissionError:
+        sys.exit(f"kbd-color: no permission to write {path}\n"
+                 "Run ./install.sh from the kbd-color project first.")
+    except OSError as e:
+        sys.exit(f"kbd-color: {path}: {e}")
+
+
+def apply(cfg):
+    r, g, b = cfg["rgb"]
+    write("brightness", str(cfg["brightness"]))
+    if cfg["brightness"] > 0:
+        write("kbd_rgb_mode", f"1 {MODES[cfg['mode']]} {r} {g} {b} {SPEEDS[cfg['speed']]}")
+
+
+def parse_color(s):
+    s = s.lower().lstrip("#")
+    if s in COLORS:
+        return list(COLORS[s])
+    if len(s) == 6:
+        try:
+            return [int(s[i:i + 2], 16) for i in (0, 2, 4)]
+        except ValueError:
+            pass
+    return None
+
+
+def gui(cfg):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, Gtk
+
+    win = Gtk.Window(title="Keyboard Light")
+    win.set_border_width(14)
+    win.set_resizable(False)
+    win.connect("destroy", Gtk.main_quit)
+    grid = Gtk.Grid(row_spacing=10, column_spacing=12)
+    win.add(grid)
+
+    def push(*_):
+        rgba = color.get_rgba()
+        cfg["rgb"] = [round(rgba.red * 255), round(rgba.green * 255), round(rgba.blue * 255)]
+        cfg["mode"] = mode.get_active_text()
+        cfg["speed"] = speed.get_active_text()
+        cfg["brightness"] = int(bright.get_value())
+        color.set_sensitive(cfg["mode"] in ("static", "breathe"))
+        speed.set_sensitive(cfg["mode"] != "static")
+        apply(cfg)
+        save(cfg)
+
+    def row(i, label, widget):
+        lbl = Gtk.Label(label=label, xalign=0)
+        grid.attach(lbl, 0, i, 1, 1)
+        widget.set_hexpand(True)
+        grid.attach(widget, 1, i, 1, 1)
+
+    color = Gtk.ColorButton()
+    rgba = Gdk.RGBA()
+    rgba.red, rgba.green, rgba.blue, rgba.alpha = (*(c / 255 for c in cfg["rgb"]), 1)
+    color.set_rgba(rgba)
+    mode = Gtk.ComboBoxText()
+    for m in MODES:
+        mode.append_text(m)
+    mode.set_active(list(MODES).index(cfg["mode"]))
+    speed = Gtk.ComboBoxText()
+    for s in SPEEDS:
+        speed.append_text(s)
+    speed.set_active(list(SPEEDS).index(cfg["speed"]))
+    bright = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 3, 1)
+    bright.set_value(cfg["brightness"])
+    bright.set_size_request(180, -1)
+
+    row(0, "Effect", mode)
+    row(1, "Colour", color)
+    row(2, "Speed", speed)
+    row(3, "Brightness", bright)
+
+    color.connect("color-set", push)
+    mode.connect("changed", push)
+    speed.connect("changed", push)
+    bright.connect("value-changed", push)
+    win.show_all()
+    color.set_sensitive(cfg["mode"] in ("static", "breathe"))
+    speed.set_sensitive(cfg["mode"] != "static")
+    Gtk.main()
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if not os.path.isdir(LED):
+        sys.exit(f"kbd-color: {LED} not found (needs an ASUS laptop with asus-wmi)")
+
+    cfg = load()
+    cmd = argv[0].lower()
+
+    if cmd == "gui":
+        return gui(cfg)
+    if cmd == "apply":
+        return apply(cfg)
+    if cmd == "off":
+        cfg["brightness"] = 0
+    elif cmd == "on":
+        cfg["brightness"] = max(cfg["brightness"], 1)
+    elif cmd == "brightness":
+        if len(argv) < 2 or argv[1] not in "0123" or len(argv[1]) != 1:
+            sys.exit("kbd-color: brightness takes 0-3")
+        cfg["brightness"] = int(argv[1])
+    else:
+        if cmd in MODES:
+            cfg["mode"] = cmd
+        else:
+            rgb = parse_color(cmd)
+            if rgb is None:
+                sys.exit(f"kbd-color: unknown command or colour '{cmd}' (try --help)")
+            cfg["mode"], cfg["rgb"] = "static", rgb
+        for a in argv[1:]:
+            if a.lower() in SPEEDS:
+                cfg["speed"] = a.lower()
+            elif parse_color(a):
+                cfg["rgb"] = parse_color(a)
+            else:
+                sys.exit(f"kbd-color: unknown argument '{a}'")
+        cfg["brightness"] = max(cfg["brightness"], 1)
+
+    apply(cfg)
+    save(cfg)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
