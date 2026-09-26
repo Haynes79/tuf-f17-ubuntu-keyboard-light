@@ -3,10 +3,12 @@
 
   kbd-color red                 solid colour by name
   kbd-color ff8800              solid colour by hex
-  kbd-color rainbow [speed]     effects: static breathe cycle rainbow
-  kbd-color breathe blue slow   effect + colour + speed
+  kbd-color rainbow [speed]     effects: static breathe cycle rainbow star rain
+                                highlight laser ripple strobe comet flash
+  kbd-color breathe blue slow   effect + colour + speed (slow|medium|fast)
   kbd-color brightness 0-3
   kbd-color off | on
+  kbd-color power awake on      keyboard light on boot / awake / sleep: on|off
   kbd-color apply               re-apply the saved setting (used at login)
   kbd-color gui                 small window
 """
@@ -17,7 +19,12 @@ import sys
 LED = os.environ.get("KBD_COLOR_LED", "/sys/class/leds/asus::kbd_backlight")
 CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "kbd-color.json")
 
-MODES = {"static": 0, "breathe": 1, "cycle": 2, "rainbow": 3}
+# Same effect numbers as G-Helper / the asus-wmi driver (9 is unused). Which ones a given
+# keyboard actually draws depends on the hardware.
+MODES = {"static": 0, "breathe": 1, "cycle": 2, "rainbow": 3, "star": 4, "rain": 5, "highlight": 6,
+         "laser": 7, "ripple": 8, "strobe": 10, "comet": 11, "flash": 12}
+NO_COLOR = {"cycle", "rainbow"}  # these effects pick their own colours
+POWER = ("boot", "awake", "sleep")
 SPEEDS = {"slow": 0, "medium": 1, "fast": 2}
 COLORS = {
     "red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
@@ -25,7 +32,8 @@ COLORS = {
     "magenta": (255, 0, 255), "purple": (128, 0, 255), "orange": (255, 100, 0),
     "pink": (255, 60, 150),
 }
-DEFAULT = {"mode": "static", "rgb": [255, 255, 255], "speed": "medium", "brightness": 3}
+DEFAULT = {"mode": "static", "rgb": [255, 255, 255], "speed": "medium", "brightness": 3,
+           "boot": True, "awake": True, "sleep": True}
 
 
 def load():
@@ -57,11 +65,19 @@ def write(name, value):
         raise KbdError(f"{path}: {e}")
 
 
-def apply(cfg):
+def apply_power(cfg):
+    """Keyboard light on boot / while awake / during sleep (G-Helper's lighting-state options)."""
+    write("kbd_rgb_state", "1 " + " ".join(str(int(cfg[k])) for k in POWER) + " 1")
+
+
+def apply(cfg, power=False):
     r, g, b = cfg["rgb"]
+    if power:
+        apply_power(cfg)
     write("brightness", str(cfg["brightness"]))
     if cfg["brightness"] > 0:
-        write("kbd_rgb_mode", f"1 {MODES[cfg['mode']]} {r} {g} {b} {SPEEDS[cfg['speed']]}")
+        # First field 0 = temporary set (G-Helper's 0xb4); 1 would save to the laptop's memory on every change.
+        write("kbd_rgb_mode", f"0 {MODES[cfg['mode']]} {r} {g} {b} {SPEEDS[cfg['speed']]}")
 
 
 def parse_color(s):
@@ -88,7 +104,7 @@ def gui(cfg):
 
     class Window(Adw.ApplicationWindow):
         def __init__(self, app):
-            super().__init__(application=app, title="Keyboard Light", default_width=440, default_height=560)
+            super().__init__(application=app, title="Keyboard Light", default_width=460, default_height=760)
             self.loading = True
             self.toasts = Adw.ToastOverlay()
             view = Adw.ToolbarView()
@@ -143,6 +159,16 @@ def gui(cfg):
             grp.add(row)
             page.add(grp)
 
+            # Keyboard light states (same idea as G-Helper's boot / awake / sleep options)
+            grp = Adw.PreferencesGroup(title="Keyboard light", description="When the light is allowed to be on")
+            self.power = {}
+            for key, title in (("boot", "On boot"), ("awake", "While awake"), ("sleep", "During sleep")):
+                sw = Adw.SwitchRow(title=title, active=bool(cfg[key]))
+                sw.connect("notify::active", self.push_power)
+                self.power[key] = sw
+                grp.add(sw)
+            page.add(grp)
+
             self.mode.connect("notify::selected", self.push)
             self.speed.connect("notify::selected", self.push)
             self.picker.connect("notify::rgba", self.push)
@@ -158,8 +184,19 @@ def gui(cfg):
 
         def refresh(self):
             m = list(MODES)[self.mode.get_selected()]
-            self.color_grp.set_sensitive(m in ("static", "breathe"))
+            self.color_grp.set_sensitive(m not in NO_COLOR)
             self.speed.set_sensitive(m != "static")
+
+        def push_power(self, *_):
+            if self.loading:
+                return
+            for key, sw in self.power.items():
+                cfg[key] = sw.get_active()
+            try:
+                apply_power(cfg)
+                save(cfg)
+            except KbdError as e:
+                self.toasts.add_toast(Adw.Toast(title=str(e), timeout=6))
 
         def on_swatch(self, _btn, name):
             self.picker.set_rgba(self.rgba(COLORS[name]))  # fires push via notify::rgba
@@ -200,7 +237,13 @@ def main(argv):
     if cmd == "gui":
         return gui(cfg)
     if cmd == "apply":
-        return apply(cfg)
+        return apply(cfg, power=True)
+    if cmd == "power":
+        if len(argv) != 3 or argv[1] not in POWER or argv[2] not in ("on", "off"):
+            sys.exit("kbd-color: usage: kbd-color power boot|awake|sleep on|off")
+        cfg[argv[1]] = argv[2] == "on"
+        apply_power(cfg)
+        return save(cfg)
     if cmd == "off":
         cfg["brightness"] = 0
     elif cmd == "on":
