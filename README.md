@@ -5,7 +5,7 @@ Uses the kernel's `asus-wmi` sysfs interface at `/sys/class/leds/asus::kbd_backl
 
 ## Install
 
-    ./install.sh      # symlinks kbd-color into ~/.local/bin, adds login autostart + a "Keyboard Light" app menu entry, installs a udev rule (sudo)
+    ./install.sh      # symlinks kbd-color into ~/.local/bin, starts a background service (applies your setting at login, keeps battery/heat colours live) + a "Keyboard Light" app menu entry, installs a udev rule (sudo)
     ./uninstall.sh
 
 The udev rule makes the light files writable by the `plugdev` group, so no sudo is needed at runtime.
@@ -14,7 +14,9 @@ The udev rule makes the light files writable by the `plugdev` group, so no sudo 
 
     kbd-color red              # solid colour by name
     kbd-color ff8800           # solid colour by hex
-    kbd-color rainbow          # effects: static breathe cycle rainbow star rain highlight laser ripple strobe comet flash
+    kbd-color cycle            # effects: static breathe cycle strobe
+    kbd-color battery          # colour follows battery level: red low -> green full
+    kbd-color heat             # colour follows CPU temperature: blue cool -> red hot
     kbd-color breathe cyan slow
     kbd-color brightness 2     # 0-3
     kbd-color off | on
@@ -35,3 +37,11 @@ The last setting is saved to `~/.config/kbd-color.json`.
 Effect numbers and the speed/colour encoding match G-Helper's TUF path (asus-wmi `kbd_rgb_mode`).
 Not every keyboard draws every effect; try them in the settings app and ignore the ones yours doesn't support.
 Changes are sent as temporary sets, so the laptop's memory isn't rewritten on every slider move.
+
+### Battery and heat colours
+
+These are software-driven: `kbd-color daemon` (run by the `kbd-color.service` systemd user service) reads the
+battery level or CPU package temperature every 2 seconds and sets a matching static colour.
+It only rewrites the light when the colour moves by a noticeable step, and never touches brightness.
+Battery: red at 10% and below, green at 80% and above. Heat: blue at 40C and below, red at 90C and above.
+Logs: `journalctl --user -u kbd-color`.

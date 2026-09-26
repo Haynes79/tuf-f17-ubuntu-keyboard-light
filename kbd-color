@@ -3,27 +3,36 @@
 
   kbd-color red                 solid colour by name
   kbd-color ff8800              solid colour by hex
-  kbd-color rainbow [speed]     effects: static breathe cycle rainbow star rain
-                                highlight laser ripple strobe comet flash
+  kbd-color cycle [speed]       effects: static breathe cycle strobe
+  kbd-color battery             colour follows battery level (red low -> green full)
+  kbd-color heat                colour follows CPU temperature (blue cool -> red hot)
   kbd-color breathe blue slow   effect + colour + speed (slow|medium|fast)
   kbd-color brightness 0-3
   kbd-color off | on
   kbd-color power awake on      keyboard light on boot / awake / sleep: on|off
   kbd-color apply               re-apply the saved setting (used at login)
+  kbd-color daemon              keeps battery/heat colours live (run by the systemd user service)
   kbd-color gui                 small window
 """
+import colorsys
+import glob
 import json
 import os
 import sys
+import time
 
 LED = os.environ.get("KBD_COLOR_LED", "/sys/class/leds/asus::kbd_backlight")
 CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "kbd-color.json")
 
-# Same effect numbers as G-Helper / the asus-wmi driver (9 is unused). Which ones a given
-# keyboard actually draws depends on the hardware.
-MODES = {"static": 0, "breathe": 1, "cycle": 2, "rainbow": 3, "star": 4, "rain": 5, "highlight": 6,
-         "laser": 7, "ripple": 8, "strobe": 10, "comet": 11, "flash": 12}
-NO_COLOR = {"cycle", "rainbow"}  # these effects pick their own colours
+# Effect numbers as used by G-Helper / the asus-wmi driver.
+MODES = {"static": 0, "breathe": 1, "cycle": 2, "strobe": 10}
+# Software-driven "effects": the daemon turns a sensor reading into a static colour.
+DYNAMIC = ("battery", "heat")
+EFFECTS = list(MODES) + list(DYNAMIC)
+LABELS = {"static": "Static", "breathe": "Breathe", "cycle": "Color cycle", "strobe": "Strobe",
+          "battery": "Battery level", "heat": "CPU temperature"}
+NO_COLOR = {"cycle", *DYNAMIC}       # these pick their own colours
+NO_SPEED = {"static", *DYNAMIC}        # these don't animate
 POWER = ("boot", "awake", "sleep")
 SPEEDS = {"slow": 0, "medium": 1, "fast": 2}
 COLORS = {
@@ -39,7 +48,12 @@ DEFAULT = {"mode": "static", "rgb": [255, 255, 255], "speed": "medium", "brightn
 def load():
     try:
         with open(CONF) as f:
-            return {**DEFAULT, **json.load(f)}
+            cfg = {**DEFAULT, **json.load(f)}
+        if cfg["mode"] == "rainbow":  # removed: this keyboard has no rainbow, colour cycle is its version
+            cfg["mode"] = "cycle"
+        if cfg["mode"] not in EFFECTS:  # e.g. another effect that was removed
+            cfg["mode"] = "static"
+        return cfg
     except (OSError, ValueError):
         return dict(DEFAULT)
 
@@ -65,19 +79,119 @@ def write(name, value):
         raise KbdError(f"{path}: {e}")
 
 
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def battery_percent():
+    for d in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        v = read_int(d + "/capacity")
+        if v is not None:
+            return v
+    return None
+
+
+def cpu_temp():
+    """CPU package temperature in degrees C, or None."""
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(d + "/name") as f:
+                if f.read().strip() != "coretemp":
+                    continue
+        except OSError:
+            continue
+        v = read_int(d + "/temp1_input")
+        if v is not None:
+            return v / 1000
+    for d in glob.glob("/sys/class/thermal/thermal_zone*"):
+        try:
+            with open(d + "/type") as f:
+                if f.read().strip() != "x86_pkg_temp":
+                    continue
+        except OSError:
+            continue
+        v = read_int(d + "/temp")
+        if v is not None:
+            return v / 1000
+    return None
+
+
+def hue_rgb(hue):
+    hue = round(hue / 5) * 5  # coarse steps, so the light isn't rewritten for tiny changes
+    return [round(c * 255) for c in colorsys.hsv_to_rgb(hue / 360, 1, 1)]
+
+
+def clamp(x):
+    return max(0.0, min(1.0, x))
+
+
+def dynamic_rgb(mode, temp=None):
+    """Colour for a sensor-driven mode. Battery: red at 10% and below, green at 80% and above.
+    Heat: blue at 40C and below, red at 90C and above."""
+    if mode == "battery":
+        pct = battery_percent()
+        return [255, 255, 255] if pct is None else hue_rgb(120 * clamp((pct - 10) / 70))
+    temp = cpu_temp() if temp is None else temp
+    return [255, 255, 255] if temp is None else hue_rgb(240 * (1 - clamp((temp - 40) / 50)))
+
+
 def apply_power(cfg):
     """Keyboard light on boot / while awake / during sleep (G-Helper's lighting-state options)."""
     write("kbd_rgb_state", "1 " + " ".join(str(int(cfg[k])) for k in POWER) + " 1")
 
 
 def apply(cfg, power=False):
-    r, g, b = cfg["rgb"]
     if power:
         apply_power(cfg)
     write("brightness", str(cfg["brightness"]))
     if cfg["brightness"] > 0:
-        # First field 0 = temporary set (G-Helper's 0xb4); 1 would save to the laptop's memory on every change.
-        write("kbd_rgb_mode", f"0 {MODES[cfg['mode']]} {r} {g} {b} {SPEEDS[cfg['speed']]}")
+        set_mode(cfg["mode"], cfg["rgb"], cfg["speed"])
+
+
+def set_mode(mode, rgb, speed):
+    """Send one colour/effect to the keyboard. Dynamic modes are shown as a static colour."""
+    if mode in DYNAMIC:
+        mode, rgb, speed = "static", dynamic_rgb(mode), "medium"
+    r, g, b = rgb
+    # First field 0 = temporary set (G-Helper's 0xb4); 1 would save to the laptop's memory on every change.
+    write("kbd_rgb_mode", f"0 {MODES[mode]} {r} {g} {b} {SPEEDS[speed]}")
+
+
+def daemon():
+    """Apply the saved setting, then keep battery / heat colours up to date."""
+    cfg = load()
+    try:
+        apply(cfg, power=True)
+    except KbdError as e:
+        print(f"kbd-color: {e}", file=sys.stderr)
+    mtime, sent, avg, tick = None, None, None, 0
+    while True:
+        try:
+            m = os.stat(CONF).st_mtime
+        except OSError:
+            m = None
+        if m != mtime:
+            mtime, cfg, sent = m, load(), None
+        if cfg["mode"] in DYNAMIC and read_int(os.path.join(LED, "brightness")):
+            temp = None
+            if cfg["mode"] == "heat":
+                t = cpu_temp()
+                if t is not None:
+                    avg = t if avg is None else 0.7 * avg + 0.3 * t  # ride out short spikes
+                temp = avg
+            rgb = dynamic_rgb(cfg["mode"], temp)
+            tick += 1
+            if rgb != sent or tick % 30 == 0:  # also refresh now and then, e.g. after suspend
+                try:
+                    set_mode(cfg["mode"], rgb, "medium")
+                    sent = rgb
+                except KbdError as e:
+                    print(f"kbd-color: {e}", file=sys.stderr)
+        time.sleep(2)
 
 
 def parse_color(s):
@@ -116,8 +230,8 @@ def gui(cfg):
 
             # Effect
             grp = Adw.PreferencesGroup(title="Effect")
-            self.mode = Adw.ComboRow(title="Effect", model=Gtk.StringList.new(list(MODES)))
-            self.mode.set_selected(list(MODES).index(cfg["mode"]))
+            self.mode = Adw.ComboRow(title="Effect", model=Gtk.StringList.new([LABELS[m] for m in EFFECTS]))
+            self.mode.set_selected(EFFECTS.index(cfg["mode"]))
             self.speed = Adw.ComboRow(title="Speed", model=Gtk.StringList.new(list(SPEEDS)))
             self.speed.set_selected(list(SPEEDS).index(cfg["speed"]))
             grp.add(self.mode)
@@ -183,9 +297,13 @@ def gui(cfg):
             return c
 
         def refresh(self):
-            m = list(MODES)[self.mode.get_selected()]
+            m = EFFECTS[self.mode.get_selected()]
             self.color_grp.set_sensitive(m not in NO_COLOR)
-            self.speed.set_sensitive(m != "static")
+            self.speed.set_sensitive(m not in NO_SPEED)
+            self.mode.set_subtitle({
+                "battery": "Red when low, green when full. Updates automatically.",
+                "heat": "Blue when cool, red when hot. Updates automatically.",
+            }.get(m, ""))
 
         def push_power(self, *_):
             if self.loading:
@@ -206,7 +324,7 @@ def gui(cfg):
                 return
             c = self.picker.get_rgba()
             cfg["rgb"] = [round(c.red * 255), round(c.green * 255), round(c.blue * 255)]
-            cfg["mode"] = list(MODES)[self.mode.get_selected()]
+            cfg["mode"] = EFFECTS[self.mode.get_selected()]
             cfg["speed"] = list(SPEEDS)[self.speed.get_selected()]
             cfg["brightness"] = int(round(self.bright.get_value()))
             self.refresh()
@@ -236,6 +354,8 @@ def main(argv):
 
     if cmd == "gui":
         return gui(cfg)
+    if cmd == "daemon":
+        return daemon()
     if cmd == "apply":
         return apply(cfg, power=True)
     if cmd == "power":
@@ -253,7 +373,7 @@ def main(argv):
             sys.exit("kbd-color: brightness takes 0-3")
         cfg["brightness"] = int(argv[1])
     else:
-        if cmd in MODES:
+        if cmd in EFFECTS:
             cfg["mode"] = cmd
         else:
             rgb = parse_color(cmd)
