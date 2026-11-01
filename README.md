@@ -5,7 +5,11 @@ Uses the kernel's `asus-wmi` sysfs interface at `/sys/class/leds/asus::kbd_backl
 
 ## Demo
 
-<!-- TODO: add your own screenshot or GIF here, e.g. ![kbd-color on the TUF F17](docs/demo.gif) -->
+The settings app (`kbd-color gui`), running on a TUF F17:
+
+![Settings app showing the CPU temperature effect, brightness slider and power toggles](docs/settings.png)
+
+![Effect menu: static, breathe, colour cycle, strobe, battery level, CPU temperature](docs/effects.png)
 
 ## Compatibility
 
