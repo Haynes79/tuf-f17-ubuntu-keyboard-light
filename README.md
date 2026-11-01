@@ -28,6 +28,7 @@ Known gaps:
 - Heat mode stays white on AMD CPUs.
 - White-only ASUS keyboards (no `kbd_rgb_mode` / `kbd_rgb_state`) get a misleading "No permission" error.
 - On non-ASUS laptops the background service keeps restarting every 5 seconds.
+- Switching effects from the keyboard only works with Fn+Left, which cycles forward through every effect. There is no way to go back with a key, because Fn+Right sends nothing to Linux on the FX706HF. Use `kbd-color prev` or the settings app instead.
 
 Reports and fixes from other hardware are welcome; open an issue with your model and `uname -r`.
 
