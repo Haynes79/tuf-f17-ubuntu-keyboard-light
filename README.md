@@ -3,6 +3,35 @@
 Tiny keyboard light controller for ASUS laptops (tested target: TUF Gaming F17 FX706HF).
 Uses the kernel's `asus-wmi` sysfs interface at `/sys/class/leds/asus::kbd_backlight/`. No dependencies beyond Python 3 (and GTK 4 + libadwaita, already on Ubuntu GNOME, for the settings app).
 
+## Demo
+
+The settings app (`kbd-color gui`), running on a TUF F17:
+
+![Settings app showing the CPU temperature effect, brightness slider and power toggles](docs/settings.png)
+
+![Effect menu: static, breathe, colour cycle, strobe, battery level, CPU temperature](docs/effects.png)
+
+## Compatibility
+
+Tested on one machine: ASUS TUF Gaming F17 FX706HF, Ubuntu GNOME, Intel CPU. Everything else is untested.
+
+| Needs | Why |
+| --- | --- |
+| ASUS laptop with an RGB keyboard | uses `kbd_rgb_mode` / `kbd_rgb_state` from `asus-wmi` |
+| Linux kernel 6.1+ | `asus::kbd_backlight` sysfs interface |
+| Ubuntu / Debian (`plugdev` group) | the udev rule grants access through `plugdev`; Fedora and Arch don't have it by default |
+| Intel CPU, for heat mode | the temperature sensor is read from `coretemp` / `x86_pkg_temp`; AMD (`k10temp`) isn't supported yet |
+| GTK 4 + libadwaita, for the settings app | already on Ubuntu GNOME |
+
+Known gaps:
+
+- Heat mode stays white on AMD CPUs.
+- White-only ASUS keyboards (no `kbd_rgb_mode` / `kbd_rgb_state`) get a misleading "No permission" error.
+- On non-ASUS laptops the background service keeps restarting every 5 seconds.
+- Switching effects from the keyboard only works with Fn+Left, which cycles forward through every effect. There is no way to go back with a key, because Fn+Right sends nothing to Linux on the FX706HF. Use `kbd-color prev` or the settings app instead.
+
+Reports and fixes from other hardware are welcome; open an issue with your model and `uname -r`.
+
 ## Install
 
     ./install.sh      # symlinks kbd-color into ~/.local/bin, starts a background service (applies your setting at login, keeps battery/heat colours live) + a "Keyboard Light" app menu entry, installs a udev rule (sudo)
